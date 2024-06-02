@@ -1,0 +1,178 @@
+---
+title: "Forecast NFLX stock"
+author: "Samarth"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(TSA)
+  library(ggplot2)
+  library(dplyr)
+  library(forecast)
+  library(tseries)
+  library(xgboost)
+  library(caret)
+  library(Metrics)
+})
+
+```
+We'll try to forecast Netflix stock price. The dataset contains NFLX stock data from 6/17/2019 to 6/15/2022. Our goal is to forecast the close price for 10 days. 
+
+source - https://finance.yahoo.com/quote/NFLX/history?p=NFLX
+
+```{r}
+netflix = read.csv("./data/NFLX.csv")
+netflix = netflix$Close
+T = 758
+ts.plot(netflix)
+netflix = ts(netflix)
+netflix_train= ts(netflix[1:747], start=1, end = 747)
+netflix_test= ts(netflix[748:757], start = 749, end = 757)
+```
+
+
+```{r}
+adf.test(netflix_train)
+```
+p-value of 0.99 suggests that the data is non-stationary
+
+
+First differencing
+```{r}
+netflix_diff1=diff(netflix_train)
+adf.test(netflix_diff1)
+```
+p-value now suggests a stationary series
+
+```{r}
+Acf(netflix_diff1)
+```
+
+Unclear if tailing or cutting off, no seasonality
+
+```{r}
+eacf(netflix_diff1)
+```
+
+2nd difference 
+```{r}
+netflix_diff2=diff(netflix_train,differences = 2)
+adf.test(netflix_diff2)
+```
+
+```{r}
+Acf(netflix_diff2)
+```
+
+With 2nd differencing, the best model is ARIMA(0,2,1). However there isn't much difference between the 1st and 2nd differencing. So we'll proceesd with 1st differencing to ensure we don't over difference. 
+
+Check BIC and AIC for serveral models
+```{r}
+Arima(netflix_train,order=c(0,1,0))
+```
+
+```{r}
+Arima(netflix_train,order=c(0,1,1))
+```
+
+```{r}
+Arima(netflix_train,order=c(1,1,0))
+```
+
+```{r}
+arima_est <- Arima(netflix_train,order=c(0,1,0))
+arima_est
+```
+
+
+
+```{r}
+arima_pred <- forecast(arima_est,h=10)
+autoplot(arima_pred)+
+autolayer(netflix_test, series="Data") +
+autolayer(arima_pred$mean, series="Forecasts")
+```
+
+Calculate RMSE 
+
+```{r}
+rmse(arima_pred$mean,netflix_test)
+```
+
+
+Train xgboost for forecasting 
+
+
+```{r echo = T, results = 'hide'}
+netflix2 = read.csv("./data/NFLX.csv")
+data <- netflix2 %>% dplyr::select(Date, Close)
+data$Date <- as.Date(data$Date)
+train <- data[data$Date < "2022-06-03",]
+test <- data[-(1:nrow(train)),]
+train_Dmatrix <- train %>%
+dplyr::select(Close) %>%
+as.matrix()
+pred_Dmatrix <- test %>%
+dplyr::select(Close) %>%
+as.matrix()
+targets <- train$Close
+#Cross-validation
+xgb_trcontrol <- trainControl(
+method = "cv",
+number = 10,
+allowParallel = TRUE,
+verboseIter = FALSE,
+returnData = FALSE
+)
+
+xgb_grid <- base::expand.grid(list( nrounds = seq(100,200), max_depth = c(6,15,20), colsample_bytree = 1,eta = 0.5, gamma = 0,
+min_child_weight = 1, subsample = 1))
+
+model_xgb <- caret::train(
+x = train_Dmatrix,y = targets,
+trControl = xgb_trcontrol,
+tuneGrid = xgb_grid,
+method = "xgbTree",
+nthread = 10
+)
+```
+
+Preparing forecast object
+
+```{r}
+fitted <- model_xgb %>%
+stats::predict(train_Dmatrix) %>%
+stats::ts(start=1, end = 748)
+data2= data$Close
+ts_netflix<- ts(data2[1:748], start=1, end = 748)
+forecast_xgb <- model_xgb %>% stats::predict(pred_Dmatrix)
+forecast_ts <- ts(forecast_xgb,start=c(749),frequency=10)
+forecast_netflix <- list(
+model = model_xgb$modelInfo,
+method = model_xgb$method,
+mean = forecast_ts,
+x = ts_netflix,
+fitted = fitted,
+residuals = as.numeric(ts_netflix) - as.numeric(fitted)
+)
+class(forecast_netflix) <- "forecast"
+observed_values <- ts(test$Close,start = 749, end = 758)
+autoplot(forecast_netflix)+
+autolayer(forecast_netflix$mean,series="Predicted",size=0.75) +
+autolayer(forecast_netflix$x,series ="Train",size=0.75 ) +
+autolayer(observed_values,series = "Observed",size=0.75) +
+#scale_x_continuous(labels =date_transform,breaks=seq(2013,2021,2))+
+guides(colour=guide_legend(title = "Time Series")) +
+ylab("Price") + xlab("Time") +
+ggtitle("") +
+theme_bw()
+```
+
+
+```{r}
+rmse(forecast_netflix$mean,test$Close)
+```
+XGBoost's performance is significantly better than ARIMA
